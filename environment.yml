@@ -1,18 +1,17 @@
-name: dehaze-bcf
+name: bviformer
 channels:
   - pytorch
   - conda-forge
   - defaults
 dependencies:
-  - python=3.10
+  - Python 3.8.20
   - pip
   - pip:
       - numpy>=1.23
-      - pillow>=9.5
-      - tqdm>=4.66
-      - pyyaml>=6.0
-      - opencv-python>=4.8
-      - scikit-image>=0.22
-      # For CPU-only PyTorch wheels:
-      - torch==2.3.1
-      - torchvision==0.18.1
+      - pillow>=10.4.0
+      - tqdm>=4.67.1
+      - pyyaml>=6.0.2
+      - opencv-python>=4.10.0.84
+      - scikit-image>=0.21.0
+      - torch==1.10+cuda
+      - torchvision==0.11.1+cuda
