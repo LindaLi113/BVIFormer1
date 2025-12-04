@@ -1,6 +1,8 @@
-# BVIFormer
+# BVIFormer: A Binocular-Vision-Inspired Transformer with Binocular Competitive Fusion for Single-Image Restoration
 
 ## Welcome to our workplace~💕👍
+
+Human vision relies on the interplay between foveal processing and binocular integration to robustly perceive structures in degraded scenes. Motivated by this observation, we revisit the image restoration problem from a binocular-vision perspective. We model binocular integration as a competitive attention mechanism and instantiate this concept in BVIFormer, a binocular-vision-inspired restoration network with a multi-scale architecture centered on a Binocular Competitive Fusion (BCF) module. BCF explicitly models competition between the two views to sharpen informative structures and suppress degradations. At each stage, a dual-branch block couples an image embedding module, Transformer blocks, and the BCF module to mimic the binocular perception and integration pathways. We apply this framework to single-image dehazing and deraining tasks. On the Dense-Haze and SOTS-Outdoor benchmarks, BVIFormer achieves 17.30 dB and 37.56 dB PSNR, respectively, surpassing the previous best results by 0.86 dB and 0.14 dB. On Rain1400 and Test2800, it attains 33.82 dB and 34.20 dB PSNR, respectively. Extensive experiments on synthetic and real-world benchmarks show consistent gains under heavy haze and severe rain streaks. Code and datasets are available at \nolinkurl{https://github.com/LindaLi113/BVIFormer}.
 
  We have submitted our paper to Scientific Report. Coming up soon......
 
