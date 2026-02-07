@@ -4,12 +4,15 @@ from PIL import Image
 import numpy as np
 import torch
 import torch.nn.functional as F
+
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 torch.backends.cudnn.benchmark = True
 warnings.filterwarnings("ignore", message=".*torch.meshgrid.*")
+
 _Y_COEF = torch.tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+
 @torch.no_grad()
 def rgb_to_y(img: torch.Tensor):
     if img.dim() == 3:
@@ -24,15 +27,15 @@ def psnr_y(a: torch.Tensor, b: torch.Tensor):
 
 def ssim_y(a: torch.Tensor, b: torch.Tensor):
     from skimage.metrics import structural_similarity as ssim
-    ay = rgb_to_y(a).clamp(0,1).cpu().numpy().squeeze()
-    by = rgb_to_y(b).clamp(0,1).cpu().numpy().squeeze()
+    ay = rgb_to_y(a).clamp(0, 1).cpu().numpy().squeeze()
+    by = rgb_to_y(b).clamp(0, 1).cpu().numpy().squeeze()
     v = ssim(ay, by, data_range=1., channel_axis=None)
     return 0. if v is None or np.isnan(v) else float(v)
 
 def load_image(path, device):
     img = Image.open(path).convert("RGB")
     arr = np.asarray(img, np.float32) / 255.0
-    ten = torch.from_numpy(arr.transpose(2,0,1)).to(device)
+    ten = torch.from_numpy(arr.transpose(2, 0, 1)).to(device)
     return ten.unsqueeze(0)
 
 def _grid(L, tile, step):
@@ -47,16 +50,56 @@ def forward_tiled(model, img, tile=336, overlap=168, bf16=False):
     step = tile - overlap
     rows, cols = _grid(H, tile, step), _grid(W, tile, step)
     out  = torch.zeros_like(img)
-    wmap = torch.zeros((1,1,H,W), device=img.device)
+    wmap = torch.zeros((1, 1, H, W), device=img.device)
 
     for top in rows:
         for left in cols:
             patch = img[..., top:top+tile, left:left+tile]
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=bf16):
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=(bf16 and img.is_cuda)):
                 pout = model(patch)
             out[...,  top:top+tile, left:left+tile] += pout
             wmap[..., top:top+tile, left:left+tile] += 1
     return out / wmap.clamp_min(1e-6)
+
+def pad_to_mod(x: torch.Tensor, mod: int, mode: str = "reflect"):
+    """
+    Pad H/W to be divisible by mod, return padded_x and (pad_h, pad_w).
+    """
+    if mod is None or mod <= 1:
+        return x, (0, 0)
+    _, _, H, W = x.shape
+    pad_h = (mod - H % mod) % mod
+    pad_w = (mod - W % mod) % mod
+    if pad_h == 0 and pad_w == 0:
+        return x, (0, 0)
+    # pad format: (left, right, top, bottom)
+    x = F.pad(x, (0, pad_w, 0, pad_h), mode=mode)
+    return x, (pad_h, pad_w)
+
+@torch.no_grad()
+def forward_full(model, img, bf16=False, pad_mod=1, pad_mode="reflect", oom_fallback=False,
+                 tile=336, overlap=168):
+    """
+    Full-image inference with optional padding.
+    If oom_fallback=True, fallback to tiled inference on CUDA OOM.
+    """
+    _, _, H, W = img.shape
+    x, (pad_h, pad_w) = pad_to_mod(img, pad_mod, mode=pad_mode)
+
+    try:
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=(bf16 and x.is_cuda)):
+            y = model(x)
+    except RuntimeError as e:
+        if oom_fallback and ("out of memory" in str(e).lower()) and x.is_cuda:
+            torch.cuda.empty_cache()
+            y = forward_tiled(model, img, tile=tile, overlap=overlap, bf16=bf16)
+            return y
+        raise
+
+    # crop back
+    if pad_h > 0 or pad_w > 0:
+        y = y[..., :H, :W]
+    return y
 
 def adapt_prefix(state_dict, want_dp):
     has_dp = next(iter(state_dict)).startswith("module.")
@@ -114,42 +157,74 @@ def main():
     ap.add_argument("--gt_dir",    required=True)
     ap.add_argument("--weights",   required=True)
     ap.add_argument("--output_csv", default="scores.csv")
-    ap.add_argument("--tile", type=int, default=336)
-    ap.add_argument("--overlap", type=int, default=168)
     ap.add_argument("--device", choices=["cuda","cpu"], default="cuda")
     ap.add_argument("--bf16", action="store_true")
+
+    # === full-image inference options (default full) ===
+    ap.add_argument("--mode", choices=["full", "tiled"], default="full",
+                    help="default: full. use tiled only when you want.")
+    ap.add_argument("--pad_mod", type=int, default=1,
+                    help="pad H/W to be divisible by this (e.g., 8/16/32). default 1 = no pad.")
+    ap.add_argument("--pad_mode", choices=["reflect","replicate","constant"], default="reflect")
+    ap.add_argument("--oom_fallback", action="store_true",
+                    help="if full OOM on CUDA, fallback to tiled.")
+
+    # kept for fallback / manual tiled
+    ap.add_argument("--tile", type=int, default=336)
+    ap.add_argument("--overlap", type=int, default=168)
+
     args = ap.parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() or args.device=="cpu" else "cpu")
+
+    device = torch.device(args.device if (torch.cuda.is_available() or args.device == "cpu") else "cpu")
     model  = load_model(args.weights, device)
+
     pairs, miss = build_pairs(args.hazy_dir, args.gt_dir)
     if len(pairs) == 0:
         raise RuntimeError("no paired hazy/gt image, please check it over.")
     if miss:
         print(f"[WARN] {len(miss)} hazy is not paired, will be skipped. Exsample:{os.path.basename(miss[0])}")
+
     t0 = time.time()
     rows = []
     psnr_sum = 0.0
     ssim_sum = 0.0
+
     for i, (hazy_p, gt_p) in enumerate(pairs, 1):
-        x = load_image(hazy_p, device).clamp(0,1)
-        g = load_image(gt_p,   device).clamp(0,1)
+        x = load_image(hazy_p, device).clamp(0, 1)
+        g = load_image(gt_p,   device).clamp(0, 1)
+
         with torch.no_grad():
-            y = forward_tiled(model, x, tile=args.tile, overlap=args.overlap, bf16=args.bf16).clamp(0,1)
+            if args.mode == "full":
+                y = forward_full(
+                    model, x,
+                    bf16=args.bf16,
+                    pad_mod=args.pad_mod,
+                    pad_mode=args.pad_mode,
+                    oom_fallback=args.oom_fallback,
+                    tile=args.tile,
+                    overlap=args.overlap
+                ).clamp(0, 1)
+            else:
+                y = forward_tiled(model, x, tile=args.tile, overlap=args.overlap, bf16=args.bf16).clamp(0, 1)
+
         p = psnr_y(y, g)
         s = ssim_y(y, g)
         psnr_sum += p
         ssim_sum += s
         rows.append([os.path.basename(hazy_p), f"{p:.4f}", f"{s:.4f}"])
+
         if i % 10 == 0 or i == len(pairs):
             print(f"[{i}/{len(pairs)}] {os.path.basename(hazy_p)}  PSNR_Y={p:.3f}  SSIM_Y={s:.4f}")
+
     psnr_avg = psnr_sum / len(pairs)
     ssim_avg = ssim_sum / len(pairs)
-    need_header = not os.path.exists(args.output_csv)
+
     with open(args.output_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["image", "psnr_y", "ssim_y"])
         w.writerows(rows)
         w.writerow(["AVERAGE", f"{psnr_avg:.4f}", f"{ssim_avg:.4f}"])
+
     print(f"==> AVERAGE: PSNR_Y={psnr_avg:.3f} dB, SSIM_Y={ssim_avg:.4f} | {time.time()-t0:.1f}s")
     print(f"Scores saved to: {args.output_csv}")
 
